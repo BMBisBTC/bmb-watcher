@@ -13,13 +13,19 @@ UPSTASH_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 HIGH_DENOM_API = 'https://bmb-monitor.vercel.app/api/highdenomination'
 
 def redis_get(key):
-    r = requests.get(f"{UPSTASH_URL}/get/{key}",
-                     headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
-    return r.json().get('result')
+    try:
+        r = requests.get(f"{UPSTASH_URL}/get/{key}",
+                         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=5)
+        return r.json().get('result')
+    except:
+        return None
 
 def redis_set(key, value):
-    requests.post(f"{UPSTASH_URL}/set/{key}/{value}",
-                  headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
+    try:
+        requests.post(f"{UPSTASH_URL}/set/{key}/{value}",
+                      headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=5)
+    except:
+        pass
 
 def address_to_scripthash(address):
     import base58
@@ -28,26 +34,6 @@ def address_to_scripthash(address):
     script = bytes([0x76, 0xa9, 0x14]) + pubkey_hash + bytes([0x88, 0xac])
     sha = hashlib.sha256(script).digest()
     return sha[::-1].hex()
-
-def get_scripthash_balance(client, scripthash):
-    client.id += 1
-    msg = json.dumps({'id': client.id, 'method': 'blockchain.scripthash.get_balance', 'params': [scripthash]}) + '\n'
-    client.sock.send(msg.encode())
-    client.buffer = ''
-    start = time.time()
-    while time.time() - start < 10:
-        try:
-            data = client.sock.recv(4096).decode()
-            client.buffer += data
-            if '\n' in client.buffer:
-                line, client.buffer = client.buffer.split('\n', 1)
-                resp = json.loads(line)
-                if 'result' in resp:
-                    r = resp['result']
-                    return (r.get('confirmed', 0) + r.get('unconfirmed', 0))
-        except socket.timeout:
-            break
-    return None
 
 def get_watched_addresses():
     try:
@@ -78,22 +64,46 @@ class ElectrumClient:
     def __init__(self):
         self.sock = None
         self.id = 0
-        self.buffer = ''
 
     def connect(self):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw.settimeout(10)
+        raw.settimeout(5)
         self.sock = ctx.wrap_socket(raw, server_hostname=ELECTRUM_HOST)
         self.sock.connect((ELECTRUM_HOST, ELECTRUM_PORT))
         self.id += 1
         msg = json.dumps({'id': self.id, 'method': 'server.version', 'params': ['bmb-watcher', '1.4']}) + '\n'
         self.sock.send(msg.encode())
-        time.sleep(0.5)
-        self.sock.recv(4096)
+        try:
+            self.sock.recv(4096)
+        except:
+            pass
         print("Electrum 연결 성공!")
+
+    def get_balance(self, scripthash):
+        try:
+            self.id += 1
+            msg = json.dumps({'id': self.id, 'method': 'blockchain.scripthash.get_balance', 'params': [scripthash]}) + '\n'
+            self.sock.send(msg.encode())
+            buf = ''
+            start = time.time()
+            while time.time() - start < 3:
+                try:
+                    data = self.sock.recv(4096).decode()
+                    buf += data
+                    if '\n' in buf:
+                        line = buf.split('\n')[0]
+                        resp = json.loads(line)
+                        if 'result' in resp:
+                            r = resp['result']
+                            return r.get('confirmed', 0) + r.get('unconfirmed', 0)
+                except socket.timeout:
+                    break
+        except Exception as e:
+            raise e
+        return None
 
 def main():
     print("BMB 고액권 감시 봇 시작...")
@@ -129,40 +139,51 @@ def main():
     client = ElectrumClient()
     client.connect()
 
-    # 초기 잔액 스냅샷
     initial_balances = {}
     for i, sh in enumerate(scripthash_list):
-        bal = get_scripthash_balance(client, sh)
-        if bal is not None:
-            initial_balances[sh] = bal
-        if (i + 1) % 100 == 0:
-            print(f"스냅샷 진행 중: {i+1}/{len(scripthash_list)}")
-        time.sleep(0.1)
-
-    print(f"스냅샷 완료! {len(initial_balances)}개 잔액 기록. 감시 시작...")
-    dropout_count = int(redis_get(dropout_key) or 0)
-
-    # 반복 감시
-    while True:
-        for sh in scripthash_list:
-            bal = get_scripthash_balance(client, sh)
-            if bal is None:
-                continue
-            old_bal = initial_balances.get(sh)
-            if old_bal is not None and bal < old_bal:
-                addr = addr_map.get(sh, sh)
-                print(f"탈락 감지: {addr} (잔액 감소: {old_bal} → {bal})")
-                dropout_count += 1
-                redis_set(dropout_key, dropout_count)
-                print(f"탈락 카운트: {dropout_count}")
+        try:
+            bal = client.get_balance(sh)
+            if bal is not None:
                 initial_balances[sh] = bal
-            time.sleep(0.1)
-        print(f"순환 완료. 현재 탈락: {dropout_count}")
+        except:
+            client = ElectrumClient()
+            client.connect()
+        if (i + 1) % 500 == 0:
+            print(f"스냅샷: {i+1}/{len(scripthash_list)}")
+
+    print(f"스냅샷 완료! {len(initial_balances)}개 기록. 감시 시작...")
+    dropout_count = int(redis_get(dropout_key) or 0)
+    cycle = 0
+
+    while True:
+        cycle += 1
+        changed = 0
+        for sh in scripthash_list:
+            try:
+                bal = client.get_balance(sh)
+                if bal is None:
+                    continue
+                old_bal = initial_balances.get(sh)
+                if old_bal is not None and bal < old_bal:
+                    addr = addr_map.get(sh, sh)
+                    print(f"탈락 감지: {addr} ({old_bal} → {bal})")
+                    dropout_count += 1
+                    redis_set(dropout_key, dropout_count)
+                    print(f"탈락 카운트: {dropout_count}")
+                    initial_balances[sh] = bal
+                    changed += 1
+            except:
+                try:
+                    client = ElectrumClient()
+                    client.connect()
+                except:
+                    time.sleep(5)
+        print(f"순환 {cycle} 완료. 탈락: {dropout_count}, 변동: {changed}")
 
 if __name__ == '__main__':
     while True:
         try:
             main()
         except Exception as e:
-            print(f"오류 발생: {e}, 30초 후 재시작...")
+            print(f"오류: {e}, 30초 후 재시작...")
             time.sleep(30)
