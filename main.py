@@ -26,7 +26,7 @@ def get_address_balance(address):
     try:
         r = requests.get(f"{EXPLORER_API}/address/{address}?limit=1&offset=0", timeout=10)
         data = r.json()
-        return data.get('balance', None)
+        return data.get('txHistory', {}).get('balanceSat', None)
     except:
         return None
 
@@ -73,7 +73,6 @@ def main():
     else:
         print(f"현재 탈락 수: {current_dropout}")
 
-    # 초기 잔액 스냅샷
     print("잔액 스냅샷 시작...")
     initial_balances = {}
     for i, addr in enumerate(addresses):
@@ -81,7 +80,7 @@ def main():
         if bal is not None:
             initial_balances[addr] = bal
         if (i + 1) % 100 == 0:
-            print(f"스냅샷: {i+1}/{len(addresses)}")
+            print(f"스냅샷: {i+1}/{len(addresses)}, 성공: {len(initial_balances)}")
         time.sleep(0.5)
 
     print(f"스냅샷 완료! {len(initial_balances)}개 기록. 감시 시작...")
@@ -106,3 +105,11 @@ def main():
                 changed += 1
             time.sleep(0.5)
         print(f"순환 {cycle} 완료. 탈락: {dropout_count}, 변동: {changed}")
+
+if __name__ == '__main__':
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print(f"오류: {e}, 30초 후 재시작...")
+            time.sleep(30)
