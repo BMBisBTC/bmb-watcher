@@ -1,140 +1,179 @@
-import time
-import requests
-import os
+import asyncio
 import json
+import os
+import ssl
+import hashlib
+import base58
+import aiohttp
 
 UPSTASH_URL = os.environ.get('KV_REST_API_URL')
 UPSTASH_TOKEN = os.environ.get('KV_REST_API_TOKEN')
-HIGH_DENOM_API = 'https://bmb-monitor.vercel.app/api/highdenomination'
-EXPLORER_API = 'https://explorer.mobick.info/api'
+ELECTRUM_HOST = 'wallet.mobick.info'
+ELECTRUM_PORT = 40009
+BATCH_SIZE = 50        # 한 번에 subscribe할 개수
+BATCH_DELAY = 0.1      # 배치 사이 대기 (초)
 
-def redis_get(key):
-    try:
-        r = requests.get(f"{UPSTASH_URL}/get/{key}",
-                         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=5)
-        return r.json().get('result')
-    except:
-        return None
 
-def redis_set(key, value):
-    try:
-        requests.post(f"{UPSTASH_URL}/set/{key}/{value}",
-                      headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=5)
-    except:
-        pass
+def address_to_scripthash(address: str) -> str:
+    decoded = base58.b58decode_check(address)
+    pubkey_hash = decoded[1:]
+    script = bytes([0x76, 0xa9, 0x14]) + pubkey_hash + bytes([0x88, 0xac])
+    sha = hashlib.sha256(script).digest()
+    return sha[::-1].hex()
 
-def get_address_balance(address):
-    try:
-        r = requests.get(f"{EXPLORER_API}/address/{address}?limit=1&offset=0", timeout=10)
-        data = r.json()
-        return data.get('txHistory', {}).get('balanceSat', None)
-    except:
-        return None
 
-def get_watched_addresses():
-    # Redis에 캐시된 주소 목록 있으면 사용
-    cached = redis_get('watcher:addresses')
-    cached_month = redis_get('watcher:month')
-    if cached and cached_month:
-        print(f"캐시된 주소 목록 사용: {cached_month}")
-        return json.loads(cached), cached_month
+async def redis_get(key: str):
+    headers = {'Authorization': f'Bearer {UPSTASH_TOKEN}'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'{UPSTASH_URL}/get/{key}', headers=headers) as r:
+            data = await r.json()
+            return data.get('result')
 
-    print("익스플로러에서 주소 목록 가져오는 중...")
-    try:
-        r = requests.get(HIGH_DENOM_API, timeout=120)
-        data = r.json()
-        months = data.get('months', [])
-        if not months:
-            return [], ''
-        latest = months[0]
-        month_key = latest['month']
-        txids = latest['txids']
-        addresses = []
-        for txid in txids:
-            tx_r = requests.get(f"{EXPLORER_API}/tx/{txid}", timeout=30)
-            tx = tx_r.json()
-            for vout in tx.get('vout', []):
-                addr = vout.get('scriptPubKey', {}).get('address')
-                val = vout.get('value', 0)
-                if addr and abs(val - 0.66666667) < 0.0001:
-                    if addr != '1BTMD8QFVfwagxAVnzscNJccgB7o8taB4P':
-                        addresses.append(addr)
 
-        # Redis에 캐시 저장
-        redis_set('watcher:addresses', json.dumps(addresses))
-        redis_set('watcher:month', month_key)
-        print(f"{len(addresses)}개 주소 캐시 저장 완료")
-        return addresses, month_key
-    except Exception as e:
-        print(f"주소 목록 가져오기 실패: {e}")
-        return [], ''
+async def redis_set(key: str, value: str):
+    headers = {'Authorization': f'Bearer {UPSTASH_TOKEN}'}
+    async with aiohttp.ClientSession() as session:
+        await session.get(f'{UPSTASH_URL}/set/{key}/{value}', headers=headers)
 
-def main():
-    print("BMB 고액권 감시 봇 시작...")
-    addresses, month_key = get_watched_addresses()
-    print(f"{month_key} 기준 {len(addresses)}개 주소")
 
-    if not addresses:
-        print("주소 목록이 비어있습니다. 종료.")
-        return
+async def redis_incr(key: str):
+    headers = {'Authorization': f'Bearer {UPSTASH_TOKEN}'}
+    async with aiohttp.ClientSession() as session:
+        await session.get(f'{UPSTASH_URL}/incr/{key}', headers=headers)
 
-    dropout_key = f"dropout:{month_key}"
-    current_dropout = redis_get(dropout_key)
-    if current_dropout is None:
-        redis_set(dropout_key, 0)
-        print(f"Redis 초기화: {dropout_key} = 0")
-    else:
-        print(f"현재 탈락 수: {current_dropout}")
 
-    # 캐시된 잔액 스냅샷 있으면 사용
-    cached_balances = redis_get('watcher:balances')
-    if cached_balances:
-        initial_balances = json.loads(cached_balances)
-        print(f"캐시된 잔액 스냅샷 사용: {len(initial_balances)}개")
-    else:
-        print("잔액 스냅샷 시작...")
-        initial_balances = {}
-        for i, addr in enumerate(addresses):
-            bal = get_address_balance(addr)
-            if bal is not None:
-                initial_balances[addr] = bal
-            if (i + 1) % 100 == 0:
-                print(f"스냅샷: {i+1}/{len(addresses)}, 성공: {len(initial_balances)}")
-                # 중간 저장
-                redis_set('watcher:balances', json.dumps(initial_balances))
-            time.sleep(0.5)
-        redis_set('watcher:balances', json.dumps(initial_balances))
-        print(f"스냅샷 완료! {len(initial_balances)}개 기록.")
+class ElectrumClient:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.reader = None
+        self.writer = None
+        self._id = 0
+        self._pending = {}       # id → Future
+        self._subscriptions = {} # scripthash → address
+        self._lock = asyncio.Lock()
 
-    print("감시 시작...")
-    dropout_count = int(redis_get(dropout_key) or 0)
-    cycle = 0
+    async def connect(self):
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        self.reader, self.writer = await asyncio.open_connection(
+            self.host, self.port, ssl=ssl_ctx)
+        print(f'Connected to {self.host}:{self.port}')
 
-    while True:
-        cycle += 1
-        changed = 0
-        for addr in addresses:
-            bal = get_address_balance(addr)
-            if bal is None:
-                time.sleep(1)
+    def _next_id(self):
+        self._id += 1
+        return self._id
+
+    async def _send(self, method, params):
+        msg_id = self._next_id()
+        msg = json.dumps({'id': msg_id, 'method': method, 'params': params}) + '\n'
+        async with self._lock:
+            self.writer.write(msg.encode())
+            await self.writer.drain()
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[msg_id] = fut
+        return msg_id, fut
+
+    async def subscribe(self, scripthash, address):
+        self._subscriptions[scripthash] = address
+        msg_id, fut = await self._send('blockchain.scripthash.subscribe', [scripthash])
+        return msg_id, fut
+
+    async def reader_loop(self, on_change):
+        """서버에서 오는 모든 메시지 처리"""
+        while True:
+            line = await self.reader.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except Exception:
                 continue
-            old_bal = initial_balances.get(addr)
-            if old_bal is not None and bal < old_bal:
-                print(f"탈락 감지: {addr} ({old_bal} → {bal})")
-                dropout_count += 1
-                redis_set(dropout_key, dropout_count)
-                print(f"탈락 카운트: {dropout_count}")
-                initial_balances[addr] = bal
-                changed += 1
-            time.sleep(0.5)
-        print(f"순환 {cycle} 완료. 탈락: {dropout_count}, 변동: {changed}")
-        # 잔액 스냅샷 업데이트
-        redis_set('watcher:balances', json.dumps(initial_balances))
+
+            # 응답 (pending future 처리)
+            if 'id' in msg and msg['id'] in self._pending:
+                fut = self._pending.pop(msg['id'])
+                if not fut.done():
+                    fut.set_result(msg.get('result'))
+
+            # 푸시 알림 (잔액 변동)
+            elif msg.get('method') == 'blockchain.scripthash.subscribe':
+                params = msg.get('params', [])
+                if len(params) >= 1:
+                    scripthash = params[0]
+                    address = self._subscriptions.get(scripthash, scripthash)
+                    asyncio.create_task(on_change(address, scripthash))
+
+
+async def load_addresses_and_balances():
+    addresses_json = await redis_get('watcher:addresses')
+    balances_json = await redis_get('watcher:balances')
+    addresses = json.loads(addresses_json) if addresses_json else []
+    balances = json.loads(balances_json) if balances_json else {}
+    return addresses, balances
+
+
+async def main():
+    addresses, balances = await load_addresses_and_balances()
+    month = await redis_get('watcher:month') or '2026-05'
+    dropout_key = f'dropout:{month}'
+
+    print(f'주소 {len(addresses)}개 로드 완료')
+    print(f'감시 월: {month}')
+
+    client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT)
+    await client.connect()
+
+    async def on_change(address, scripthash):
+        """잔액 변동 감지 시 호출"""
+        prev_balance = balances.get(address, 0)
+        # 잔액이 줄었으면 탈락 (출금)
+        # scripthash.get_balance로 현재 잔액 확인
+        _, fut = await client._send('blockchain.scripthash.get_balance', [scripthash])
+        try:
+            result = await asyncio.wait_for(fut, timeout=10)
+            if result:
+                confirmed = result.get('confirmed', 0)
+                if confirmed < prev_balance:
+                    print(f'탈락 감지: {address} ({prev_balance} → {confirmed})')
+                    await redis_incr(dropout_key)
+                    balances[address] = confirmed
+                    await redis_set('watcher:balances', json.dumps(balances))
+        except asyncio.TimeoutError:
+            print(f'타임아웃: {address}')
+
+    # reader loop 백그라운드 실행
+    reader_task = asyncio.create_task(client.reader_loop(on_change))
+
+    # 배치로 subscribe
+    print(f'Subscribe 시작 ({len(addresses)}개, 배치 {BATCH_SIZE}개씩)')
+    futures = []
+    for i in range(0, len(addresses), BATCH_SIZE):
+        batch = addresses[i:i+BATCH_SIZE]
+        for address in batch:
+            sh = address_to_scripthash(address)
+            msg_id, fut = await client.subscribe(sh, address)
+            futures.append((address, sh, fut))
+        await asyncio.sleep(BATCH_DELAY)
+        print(f'  {min(i+BATCH_SIZE, len(addresses))}/{len(addresses)} 구독 완료')
+
+    # 초기 잔액 스냅샷 수집 (balances가 비어있을 때만)
+    if not balances:
+        print('초기 잔액 스냅샷 수집 중...')
+        for address, sh, fut in futures:
+            try:
+                result = await asyncio.wait_for(fut, timeout=30)
+                if result is not None:
+                    balances[address] = result  # scripthash 상태값 저장
+            except asyncio.TimeoutError:
+                pass
+        await redis_set('watcher:balances', json.dumps(balances))
+        print('스냅샷 저장 완료')
+
+    print('감시 중...')
+    await reader_task  # 영구 대기
+
 
 if __name__ == '__main__':
-    while True:
-        try:
-            main()
-        except Exception as e:
-            print(f"오류: {e}, 30초 후 재시작...")
-            time.sleep(30)
+    asyncio.run(main())
