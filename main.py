@@ -1,6 +1,7 @@
 import time
 import requests
 import os
+import json
 
 UPSTASH_URL = os.environ.get('KV_REST_API_URL')
 UPSTASH_TOKEN = os.environ.get('KV_REST_API_TOKEN')
@@ -31,6 +32,14 @@ def get_address_balance(address):
         return None
 
 def get_watched_addresses():
+    # Redis에 캐시된 주소 목록 있으면 사용
+    cached = redis_get('watcher:addresses')
+    cached_month = redis_get('watcher:month')
+    if cached and cached_month:
+        print(f"캐시된 주소 목록 사용: {cached_month}")
+        return json.loads(cached), cached_month
+
+    print("익스플로러에서 주소 목록 가져오는 중...")
     try:
         r = requests.get(HIGH_DENOM_API, timeout=120)
         data = r.json()
@@ -50,6 +59,11 @@ def get_watched_addresses():
                 if addr and abs(val - 0.66666667) < 0.0001:
                     if addr != '1BTMD8QFVfwagxAVnzscNJccgB7o8taB4P':
                         addresses.append(addr)
+
+        # Redis에 캐시 저장
+        redis_set('watcher:addresses', json.dumps(addresses))
+        redis_set('watcher:month', month_key)
+        print(f"{len(addresses)}개 주소 캐시 저장 완료")
         return addresses, month_key
     except Exception as e:
         print(f"주소 목록 가져오기 실패: {e}")
@@ -57,9 +71,8 @@ def get_watched_addresses():
 
 def main():
     print("BMB 고액권 감시 봇 시작...")
-    print("이자 지급 주소 목록 가져오는 중...")
     addresses, month_key = get_watched_addresses()
-    print(f"{month_key} 기준 {len(addresses)}개 주소 감시 시작")
+    print(f"{month_key} 기준 {len(addresses)}개 주소")
 
     if not addresses:
         print("주소 목록이 비어있습니다. 종료.")
@@ -73,17 +86,27 @@ def main():
     else:
         print(f"현재 탈락 수: {current_dropout}")
 
-    print("잔액 스냅샷 시작...")
-    initial_balances = {}
-    for i, addr in enumerate(addresses):
-        bal = get_address_balance(addr)
-        if bal is not None:
-            initial_balances[addr] = bal
-        if (i + 1) % 100 == 0:
-            print(f"스냅샷: {i+1}/{len(addresses)}, 성공: {len(initial_balances)}")
-        time.sleep(0.5)
+    # 캐시된 잔액 스냅샷 있으면 사용
+    cached_balances = redis_get('watcher:balances')
+    if cached_balances:
+        initial_balances = json.loads(cached_balances)
+        print(f"캐시된 잔액 스냅샷 사용: {len(initial_balances)}개")
+    else:
+        print("잔액 스냅샷 시작...")
+        initial_balances = {}
+        for i, addr in enumerate(addresses):
+            bal = get_address_balance(addr)
+            if bal is not None:
+                initial_balances[addr] = bal
+            if (i + 1) % 100 == 0:
+                print(f"스냅샷: {i+1}/{len(addresses)}, 성공: {len(initial_balances)}")
+                # 중간 저장
+                redis_set('watcher:balances', json.dumps(initial_balances))
+            time.sleep(0.5)
+        redis_set('watcher:balances', json.dumps(initial_balances))
+        print(f"스냅샷 완료! {len(initial_balances)}개 기록.")
 
-    print(f"스냅샷 완료! {len(initial_balances)}개 기록. 감시 시작...")
+    print("감시 시작...")
     dropout_count = int(redis_get(dropout_key) or 0)
     cycle = 0
 
@@ -105,6 +128,8 @@ def main():
                 changed += 1
             time.sleep(0.5)
         print(f"순환 {cycle} 완료. 탈락: {dropout_count}, 변동: {changed}")
+        # 잔액 스냅샷 업데이트
+        redis_set('watcher:balances', json.dumps(initial_balances))
 
 if __name__ == '__main__':
     while True:
