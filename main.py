@@ -14,7 +14,7 @@ UPSTASH_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 HIGH_DENOM_API = 'https://bmb-monitor.vercel.app/api/highdenomination'
 
 def redis_get(key):
-    r = requests.get(f"{UPSTASH_URL}/get/{key}", 
+    r = requests.get(f"{UPSTASH_URL}/get/{key}",
                      headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
     data = r.json()
     return data.get('result')
@@ -24,7 +24,6 @@ def redis_set(key, value):
                   headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
 
 def address_to_scripthash(address):
-    # 비트코인 주소를 Electrum scripthash 형식으로 변환
     import base58
     decoded = base58.b58decode_check(address)
     pubkey_hash = decoded[1:]
@@ -33,20 +32,15 @@ def address_to_scripthash(address):
     return sha[::-1].hex()
 
 def get_watched_addresses():
-    """가장 최근 이자 지급 받은 지갑 주소 목록 가져오기"""
     try:
         r = requests.get(HIGH_DENOM_API, timeout=120)
         data = r.json()
         months = data.get('months', [])
         if not months:
-            return [], 0
-        # 가장 최근 달 (첫 번째)
+            return [], ''
         latest = months[0]
         month_key = latest['month']
-        count = latest['count']
         txids = latest['txids']
-        
-        # 각 TX에서 주소 추출
         addresses = []
         for txid in txids:
             tx_r = requests.get(f"https://explorer.mobick.info/api/tx/{txid}", timeout=30)
@@ -57,7 +51,6 @@ def get_watched_addresses():
                 if addr and abs(val - 0.66666667) < 0.0001:
                     if addr != '1BTMD8QFVfwagxAVnzscNJccgB7o8taB4P':
                         addresses.append(addr)
-        
         return addresses, month_key
     except Exception as e:
         print(f"주소 목록 가져오기 실패: {e}")
@@ -68,7 +61,7 @@ class ElectrumClient:
         self.sock = None
         self.id = 0
         self.buffer = ''
-    
+
     def connect(self):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -80,13 +73,13 @@ class ElectrumClient:
         self.send('server.version', ['bmb-watcher', '1.4'])
         self.recv()
         print("Electrum 연결 성공!")
-    
+
     def send(self, method, params=None):
         self.id += 1
         msg = json.dumps({'id': self.id, 'method': method, 'params': params or []}) + '\n'
         self.sock.send(msg.encode())
         return self.id
-    
+
     def recv(self):
         while True:
             try:
@@ -97,10 +90,10 @@ class ElectrumClient:
                     return json.loads(line)
             except socket.timeout:
                 return None
-    
+
     def subscribe(self, scripthash):
         self.send('blockchain.scripthash.subscribe', [scripthash])
-    
+
     def listen(self):
         self.sock.settimeout(60)
         while True:
@@ -114,7 +107,6 @@ class ElectrumClient:
                     if line.strip():
                         yield json.loads(line)
             except socket.timeout:
-                # keepalive
                 self.send('server.ping', [])
                 continue
             except Exception as e:
@@ -123,17 +115,14 @@ class ElectrumClient:
 
 def main():
     print("BMB 고액권 감시 봇 시작...")
-    
-    # 감시할 주소 목록 가져오기
     print("이자 지급 주소 목록 가져오는 중...")
     addresses, month_key = get_watched_addresses()
     print(f"{month_key} 기준 {len(addresses)}개 주소 감시 시작")
-    
+
     if not addresses:
         print("주소 목록이 비어있습니다. 종료.")
         return
-    
-    # Redis에 초기 상태 저장
+
     dropout_key = f"dropout:{month_key}"
     current_dropout = redis_get(dropout_key)
     if current_dropout is None:
@@ -141,8 +130,7 @@ def main():
         print(f"Redis 초기화: {dropout_key} = 0")
     else:
         print(f"현재 탈락 수: {current_dropout}")
-    
-    # scripthash 변환
+
     print("scripthash 변환 중...")
     scripthash_to_addr = {}
     for addr in addresses:
@@ -151,21 +139,19 @@ def main():
             scripthash_to_addr[sh] = addr
         except Exception as e:
             print(f"변환 실패 {addr}: {e}")
-    
+
     print(f"{len(scripthash_to_addr)}개 scripthash 변환 완료")
-    
-    # Electrum 연결 및 구독
+
     client = ElectrumClient()
     client.connect()
-    
-print("주소 구독 중...")
+
+    print("주소 구독 중...")
     for sh in scripthash_to_addr:
         client.subscribe(sh)
-    
-    print(f"구독 완료! 변동 감시 중...")
+
+    print("구독 완료! 변동 감시 중...")
     initial_states = {}
-    
-    # 변동 감지
+
     for msg in client.listen():
         if msg.get('method') == 'blockchain.scripthash.subscribe':
             params = msg.get('params', [])
@@ -173,17 +159,16 @@ print("주소 구독 중...")
                 sh = params[0]
                 new_status = params[1]
                 old_status = initial_states.get(sh)
-                
+                if sh not in initial_states:
+                    initial_states[sh] = new_status
+                    continue
                 if old_status != new_status:
                     addr = scripthash_to_addr.get(sh, sh)
                     print(f"잔액 변동 감지: {addr}")
-                    
-                    # 탈락 카운트 증가
                     current = int(redis_get(dropout_key) or 0)
                     current += 1
                     redis_set(dropout_key, current)
                     print(f"탈락 카운트 업데이트: {current}")
-                    
                     initial_states[sh] = new_status
 
 if __name__ == '__main__':
