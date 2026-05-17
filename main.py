@@ -10,8 +10,8 @@ UPSTASH_URL = os.environ.get('KV_REST_API_URL')
 UPSTASH_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 ELECTRUM_HOST = 'wallet.mobick.info'
 ELECTRUM_PORT = 40009
-SUBS_PER_CONNECTION = 100  # 연결당 구독 수 (150에서 끊겼으니 100으로 안전하게)
-BATCH_DELAY = 0.05         # 구독 사이 대기
+SUBS_PER_CONNECTION = 100
+BATCH_DELAY = 0.1
 
 
 def address_to_scripthash(address: str) -> str:
@@ -60,7 +60,23 @@ class ElectrumClient:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         self.reader, self.writer = await asyncio.open_connection(
             self.host, self.port, ssl=ssl_ctx)
-        print(f'[{self.name}] Connected')
+        # 핸드셰이크 먼저
+        await self._handshake()
+        print(f'[{self.name}] Connected & handshake OK')
+
+    async def _handshake(self):
+        msg_id = self._next_id()
+        msg = json.dumps({
+            'id': msg_id,
+            'method': 'server.version',
+            'params': ['bmb-watcher', '1.4']
+        }) + '\n'
+        self.writer.write(msg.encode())
+        await self.writer.drain()
+        # 응답 읽기
+        line = await asyncio.wait_for(self.reader.readline(), timeout=10)
+        resp = json.loads(line)
+        print(f'[{self.name}] server.version: {resp.get("result")}')
 
     def _next_id(self):
         self._id += 1
@@ -86,14 +102,13 @@ class ElectrumClient:
             try:
                 line = await self.reader.readline()
                 if not line:
-                    print(f'[{self.name}] 연결 끊김 - 재연결 시도')
-                    await self.reconnect(on_change)
+                    print(f'[{self.name}] 연결 끊김')
+                    asyncio.create_task(self._reconnect(on_change))
                     return
                 msg = json.loads(line)
             except Exception as e:
                 print(f'[{self.name}] 읽기 오류: {e}')
-                await asyncio.sleep(5)
-                await self.reconnect(on_change)
+                asyncio.create_task(self._reconnect(on_change))
                 return
 
             if 'id' in msg and msg['id'] in self._pending:
@@ -108,36 +123,20 @@ class ElectrumClient:
                     address = self._subscriptions.get(scripthash, scripthash)
                     asyncio.create_task(on_change(address, scripthash))
 
-    async def reconnect(self, on_change):
+    async def _reconnect(self, on_change):
         print(f'[{self.name}] 재연결 중...')
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
         try:
             await self.connect()
-            # 구독 복구
             subs = list(self._subscriptions.items())
             for sh, addr in subs:
                 await self._send('blockchain.scripthash.subscribe', [sh])
                 await asyncio.sleep(BATCH_DELAY)
-            print(f'[{self.name}] 재연결 및 구독 복구 완료 ({len(subs)}개)')
+            print(f'[{self.name}] 재연결 완료 ({len(subs)}개)')
             asyncio.create_task(self.reader_loop(on_change))
         except Exception as e:
             print(f'[{self.name}] 재연결 실패: {e}')
-            await self.reconnect(on_change)
-
-
-async def run_connection(conn_id, addresses, balances, dropout_key, on_change_callback):
-    client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT, name=f'conn-{conn_id}')
-    await client.connect()
-
-    reader_task = asyncio.create_task(client.reader_loop(on_change_callback(client)))
-
-    for address in addresses:
-        sh = address_to_scripthash(address)
-        await client.subscribe(sh, address)
-        await asyncio.sleep(BATCH_DELAY)
-
-    print(f'[conn-{conn_id}] {len(addresses)}개 구독 완료')
-    await reader_task
+            asyncio.create_task(self._reconnect(on_change))
 
 
 async def main():
@@ -151,7 +150,6 @@ async def main():
     print(f'주소 {len(addresses)}개 로드 완료')
     print(f'감시 월: {month}')
 
-    # 연결당 SUBS_PER_CONNECTION개씩 나누기
     chunks = [addresses[i:i+SUBS_PER_CONNECTION]
               for i in range(0, len(addresses), SUBS_PER_CONNECTION)]
     print(f'총 {len(chunks)}개 연결로 분산')
@@ -173,19 +171,26 @@ async def main():
                 print(f'타임아웃: {address}')
         return on_change
 
-    # 모든 연결 동시 실행
     tasks = []
     for i, chunk in enumerate(chunks):
+        await asyncio.sleep(1)  # 연결 사이 간격
         client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT, name=f'conn-{i}')
-        await client.connect()
-        await asyncio.sleep(0.5)  # 연결 사이 간격
+        try:
+            await client.connect()
+        except Exception as e:
+            print(f'[conn-{i}] 연결 실패: {e}')
+            continue
 
         on_change = make_on_change(client)
         reader_task = asyncio.create_task(client.reader_loop(on_change))
 
         for address in chunk:
             sh = address_to_scripthash(address)
-            await client.subscribe(sh, address)
+            try:
+                await client.subscribe(sh, address)
+            except Exception as e:
+                print(f'[conn-{i}] subscribe 실패: {e}')
+                break
             await asyncio.sleep(BATCH_DELAY)
 
         print(f'[conn-{i}] {len(chunk)}개 구독 완료')
