@@ -6,7 +6,6 @@ import time
 import requests
 import os
 
-# 설정
 ELECTRUM_HOST = 'wallet.mobick.info'
 ELECTRUM_PORT = 40009
 UPSTASH_URL = os.environ.get('KV_REST_API_URL')
@@ -16,8 +15,7 @@ HIGH_DENOM_API = 'https://bmb-monitor.vercel.app/api/highdenomination'
 def redis_get(key):
     r = requests.get(f"{UPSTASH_URL}/get/{key}",
                      headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
-    data = r.json()
-    return data.get('result')
+    return r.json().get('result')
 
 def redis_set(key, value):
     requests.post(f"{UPSTASH_URL}/set/{key}/{value}",
@@ -30,6 +28,26 @@ def address_to_scripthash(address):
     script = bytes([0x76, 0xa9, 0x14]) + pubkey_hash + bytes([0x88, 0xac])
     sha = hashlib.sha256(script).digest()
     return sha[::-1].hex()
+
+def get_scripthash_balance(client, scripthash):
+    client.id += 1
+    msg = json.dumps({'id': client.id, 'method': 'blockchain.scripthash.get_balance', 'params': [scripthash]}) + '\n'
+    client.sock.send(msg.encode())
+    client.buffer = ''
+    start = time.time()
+    while time.time() - start < 10:
+        try:
+            data = client.sock.recv(4096).decode()
+            client.buffer += data
+            if '\n' in client.buffer:
+                line, client.buffer = client.buffer.split('\n', 1)
+                resp = json.loads(line)
+                if 'result' in resp:
+                    r = resp['result']
+                    return (r.get('confirmed', 0) + r.get('unconfirmed', 0))
+        except socket.timeout:
+            break
+    return None
 
 def get_watched_addresses():
     try:
@@ -67,51 +85,15 @@ class ElectrumClient:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw.settimeout(30)
+        raw.settimeout(10)
         self.sock = ctx.wrap_socket(raw, server_hostname=ELECTRUM_HOST)
         self.sock.connect((ELECTRUM_HOST, ELECTRUM_PORT))
-        self.send('server.version', ['bmb-watcher', '1.4'])
-        self.recv()
-        print("Electrum 연결 성공!")
-
-    def send(self, method, params=None):
         self.id += 1
-        msg = json.dumps({'id': self.id, 'method': method, 'params': params or []}) + '\n'
+        msg = json.dumps({'id': self.id, 'method': 'server.version', 'params': ['bmb-watcher', '1.4']}) + '\n'
         self.sock.send(msg.encode())
-        return self.id
-
-    def recv(self):
-        while True:
-            try:
-                data = self.sock.recv(4096).decode()
-                self.buffer += data
-                if '\n' in self.buffer:
-                    line, self.buffer = self.buffer.split('\n', 1)
-                    return json.loads(line)
-            except socket.timeout:
-                return None
-
-    def subscribe(self, scripthash):
-        self.send('blockchain.scripthash.subscribe', [scripthash])
-
-    def listen(self):
-        self.sock.settimeout(60)
-        while True:
-            try:
-                data = self.sock.recv(4096).decode()
-                if not data:
-                    break
-                self.buffer += data
-                while '\n' in self.buffer:
-                    line, self.buffer = self.buffer.split('\n', 1)
-                    if line.strip():
-                        yield json.loads(line)
-            except socket.timeout:
-                self.send('server.ping', [])
-                continue
-            except Exception as e:
-                print(f"수신 오류: {e}")
-                break
+        time.sleep(0.5)
+        self.sock.recv(4096)
+        print("Electrum 연결 성공!")
 
 def main():
     print("BMB 고액권 감시 봇 시작...")
@@ -132,44 +114,50 @@ def main():
         print(f"현재 탈락 수: {current_dropout}")
 
     print("scripthash 변환 중...")
-    scripthash_to_addr = {}
+    scripthash_list = []
+    addr_map = {}
     for addr in addresses:
         try:
             sh = address_to_scripthash(addr)
-            scripthash_to_addr[sh] = addr
+            scripthash_list.append(sh)
+            addr_map[sh] = addr
         except Exception as e:
             print(f"변환 실패 {addr}: {e}")
 
-    print(f"{len(scripthash_to_addr)}개 scripthash 변환 완료")
+    print(f"{len(scripthash_list)}개 변환 완료, 잔액 스냅샷 시작...")
 
     client = ElectrumClient()
     client.connect()
 
-    print("주소 구독 중...")
-    for sh in scripthash_to_addr:
-        client.subscribe(sh)
+    # 초기 잔액 스냅샷
+    initial_balances = {}
+    for i, sh in enumerate(scripthash_list):
+        bal = get_scripthash_balance(client, sh)
+        if bal is not None:
+            initial_balances[sh] = bal
+        if (i + 1) % 100 == 0:
+            print(f"스냅샷 진행 중: {i+1}/{len(scripthash_list)}")
+        time.sleep(0.1)
 
-    print("구독 완료! 변동 감시 중...")
-    initial_states = {}
+    print(f"스냅샷 완료! {len(initial_balances)}개 잔액 기록. 감시 시작...")
+    dropout_count = int(redis_get(dropout_key) or 0)
 
-    for msg in client.listen():
-        if msg.get('method') == 'blockchain.scripthash.subscribe':
-            params = msg.get('params', [])
-            if len(params) >= 2:
-                sh = params[0]
-                new_status = params[1]
-                old_status = initial_states.get(sh)
-                if sh not in initial_states:
-                    initial_states[sh] = new_status
-                    continue
-                if old_status != new_status:
-                    addr = scripthash_to_addr.get(sh, sh)
-                    print(f"잔액 변동 감지: {addr}")
-                    current = int(redis_get(dropout_key) or 0)
-                    current += 1
-                    redis_set(dropout_key, current)
-                    print(f"탈락 카운트 업데이트: {current}")
-                    initial_states[sh] = new_status
+    # 반복 감시
+    while True:
+        for sh in scripthash_list:
+            bal = get_scripthash_balance(client, sh)
+            if bal is None:
+                continue
+            old_bal = initial_balances.get(sh)
+            if old_bal is not None and bal < old_bal:
+                addr = addr_map.get(sh, sh)
+                print(f"탈락 감지: {addr} (잔액 감소: {old_bal} → {bal})")
+                dropout_count += 1
+                redis_set(dropout_key, dropout_count)
+                print(f"탈락 카운트: {dropout_count}")
+                initial_balances[sh] = bal
+            time.sleep(0.1)
+        print(f"순환 완료. 현재 탈락: {dropout_count}")
 
 if __name__ == '__main__':
     while True:
