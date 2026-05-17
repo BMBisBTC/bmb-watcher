@@ -158,16 +158,12 @@ def main():
     client = ElectrumClient()
     client.connect()
     
-    print("주소 구독 중...")
-    initial_states = {}
+print("주소 구독 중...")
     for sh in scripthash_to_addr:
         client.subscribe(sh)
-        resp = client.recv()
-        if resp and 'result' in resp:
-            initial_states[sh] = resp['result']
-        time.sleep(0.01)
     
     print(f"구독 완료! 변동 감시 중...")
+    initial_states = {}
     
     # 변동 감지
     for msg in client.listen():
