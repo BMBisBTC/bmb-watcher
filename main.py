@@ -10,8 +10,8 @@ UPSTASH_URL = os.environ.get('KV_REST_API_URL')
 UPSTASH_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 ELECTRUM_HOST = 'wallet.mobick.info'
 ELECTRUM_PORT = 40009
-BATCH_SIZE = 50        # 한 번에 subscribe할 개수
-BATCH_DELAY = 0.1      # 배치 사이 대기 (초)
+SUBS_PER_CONNECTION = 100  # 연결당 구독 수 (150에서 끊겼으니 100으로 안전하게)
+BATCH_DELAY = 0.05         # 구독 사이 대기
 
 
 def address_to_scripthash(address: str) -> str:
@@ -43,14 +43,15 @@ async def redis_incr(key: str):
 
 
 class ElectrumClient:
-    def __init__(self, host, port):
+    def __init__(self, host, port, name=''):
         self.host = host
         self.port = port
+        self.name = name
         self.reader = None
         self.writer = None
         self._id = 0
-        self._pending = {}       # id → Future
-        self._subscriptions = {} # scripthash → address
+        self._pending = {}
+        self._subscriptions = {}
         self._lock = asyncio.Lock()
 
     async def connect(self):
@@ -59,7 +60,7 @@ class ElectrumClient:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         self.reader, self.writer = await asyncio.open_connection(
             self.host, self.port, ssl=ssl_ctx)
-        print(f'Connected to {self.host}:{self.port}')
+        print(f'[{self.name}] Connected')
 
     def _next_id(self):
         self._id += 1
@@ -81,23 +82,25 @@ class ElectrumClient:
         return msg_id, fut
 
     async def reader_loop(self, on_change):
-        """서버에서 오는 모든 메시지 처리"""
         while True:
-            line = await self.reader.readline()
-            if not line:
-                break
             try:
+                line = await self.reader.readline()
+                if not line:
+                    print(f'[{self.name}] 연결 끊김 - 재연결 시도')
+                    await self.reconnect(on_change)
+                    return
                 msg = json.loads(line)
-            except Exception:
-                continue
+            except Exception as e:
+                print(f'[{self.name}] 읽기 오류: {e}')
+                await asyncio.sleep(5)
+                await self.reconnect(on_change)
+                return
 
-            # 응답 (pending future 처리)
             if 'id' in msg and msg['id'] in self._pending:
                 fut = self._pending.pop(msg['id'])
                 if not fut.done():
                     fut.set_result(msg.get('result'))
 
-            # 푸시 알림 (잔액 변동)
             elif msg.get('method') == 'blockchain.scripthash.subscribe':
                 params = msg.get('params', [])
                 if len(params) >= 1:
@@ -105,74 +108,91 @@ class ElectrumClient:
                     address = self._subscriptions.get(scripthash, scripthash)
                     asyncio.create_task(on_change(address, scripthash))
 
+    async def reconnect(self, on_change):
+        print(f'[{self.name}] 재연결 중...')
+        await asyncio.sleep(10)
+        try:
+            await self.connect()
+            # 구독 복구
+            subs = list(self._subscriptions.items())
+            for sh, addr in subs:
+                await self._send('blockchain.scripthash.subscribe', [sh])
+                await asyncio.sleep(BATCH_DELAY)
+            print(f'[{self.name}] 재연결 및 구독 복구 완료 ({len(subs)}개)')
+            asyncio.create_task(self.reader_loop(on_change))
+        except Exception as e:
+            print(f'[{self.name}] 재연결 실패: {e}')
+            await self.reconnect(on_change)
 
-async def load_addresses_and_balances():
+
+async def run_connection(conn_id, addresses, balances, dropout_key, on_change_callback):
+    client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT, name=f'conn-{conn_id}')
+    await client.connect()
+
+    reader_task = asyncio.create_task(client.reader_loop(on_change_callback(client)))
+
+    for address in addresses:
+        sh = address_to_scripthash(address)
+        await client.subscribe(sh, address)
+        await asyncio.sleep(BATCH_DELAY)
+
+    print(f'[conn-{conn_id}] {len(addresses)}개 구독 완료')
+    await reader_task
+
+
+async def main():
     addresses_json = await redis_get('watcher:addresses')
     balances_json = await redis_get('watcher:balances')
     addresses = json.loads(addresses_json) if addresses_json else []
     balances = json.loads(balances_json) if balances_json else {}
-    return addresses, balances
-
-
-async def main():
-    addresses, balances = await load_addresses_and_balances()
     month = await redis_get('watcher:month') or '2026-05'
     dropout_key = f'dropout:{month}'
 
     print(f'주소 {len(addresses)}개 로드 완료')
     print(f'감시 월: {month}')
 
-    client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT)
-    await client.connect()
+    # 연결당 SUBS_PER_CONNECTION개씩 나누기
+    chunks = [addresses[i:i+SUBS_PER_CONNECTION]
+              for i in range(0, len(addresses), SUBS_PER_CONNECTION)]
+    print(f'총 {len(chunks)}개 연결로 분산')
 
-    async def on_change(address, scripthash):
-        """잔액 변동 감지 시 호출"""
-        prev_balance = balances.get(address, 0)
-        # 잔액이 줄었으면 탈락 (출금)
-        # scripthash.get_balance로 현재 잔액 확인
-        _, fut = await client._send('blockchain.scripthash.get_balance', [scripthash])
-        try:
-            result = await asyncio.wait_for(fut, timeout=10)
-            if result:
-                confirmed = result.get('confirmed', 0)
-                if confirmed < prev_balance:
-                    print(f'탈락 감지: {address} ({prev_balance} → {confirmed})')
-                    await redis_incr(dropout_key)
-                    balances[address] = confirmed
-                    await redis_set('watcher:balances', json.dumps(balances))
-        except asyncio.TimeoutError:
-            print(f'타임아웃: {address}')
-
-    # reader loop 백그라운드 실행
-    reader_task = asyncio.create_task(client.reader_loop(on_change))
-
-    # 배치로 subscribe
-    print(f'Subscribe 시작 ({len(addresses)}개, 배치 {BATCH_SIZE}개씩)')
-    futures = []
-    for i in range(0, len(addresses), BATCH_SIZE):
-        batch = addresses[i:i+BATCH_SIZE]
-        for address in batch:
-            sh = address_to_scripthash(address)
-            msg_id, fut = await client.subscribe(sh, address)
-            futures.append((address, sh, fut))
-        await asyncio.sleep(BATCH_DELAY)
-        print(f'  {min(i+BATCH_SIZE, len(addresses))}/{len(addresses)} 구독 완료')
-
-    # 초기 잔액 스냅샷 수집 (balances가 비어있을 때만)
-    if not balances:
-        print('초기 잔액 스냅샷 수집 중...')
-        for address, sh, fut in futures:
+    def make_on_change(client):
+        async def on_change(address, scripthash):
+            prev_balance = balances.get(address, 0)
+            _, fut = await client._send('blockchain.scripthash.get_balance', [scripthash])
             try:
-                result = await asyncio.wait_for(fut, timeout=30)
-                if result is not None:
-                    balances[address] = result  # scripthash 상태값 저장
+                result = await asyncio.wait_for(fut, timeout=10)
+                if result:
+                    confirmed = result.get('confirmed', 0)
+                    if confirmed < prev_balance:
+                        print(f'탈락 감지: {address} ({prev_balance} → {confirmed})')
+                        await redis_incr(dropout_key)
+                        balances[address] = confirmed
+                        await redis_set('watcher:balances', json.dumps(balances))
             except asyncio.TimeoutError:
-                pass
-        await redis_set('watcher:balances', json.dumps(balances))
-        print('스냅샷 저장 완료')
+                print(f'타임아웃: {address}')
+        return on_change
 
-    print('감시 중...')
-    await reader_task  # 영구 대기
+    # 모든 연결 동시 실행
+    tasks = []
+    for i, chunk in enumerate(chunks):
+        client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT, name=f'conn-{i}')
+        await client.connect()
+        await asyncio.sleep(0.5)  # 연결 사이 간격
+
+        on_change = make_on_change(client)
+        reader_task = asyncio.create_task(client.reader_loop(on_change))
+
+        for address in chunk:
+            sh = address_to_scripthash(address)
+            await client.subscribe(sh, address)
+            await asyncio.sleep(BATCH_DELAY)
+
+        print(f'[conn-{i}] {len(chunk)}개 구독 완료')
+        tasks.append(reader_task)
+
+    print('전체 구독 완료. 감시 중...')
+    await asyncio.gather(*tasks)
 
 
 if __name__ == '__main__':
