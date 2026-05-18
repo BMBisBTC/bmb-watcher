@@ -485,10 +485,29 @@ class PayoutWatcher:
 
 
 async def main():
-    addresses_json = await redis_get('watcher:addresses')
-    balances_json = await redis_get('watcher:balances')
-    addresses = json.loads(addresses_json) if addresses_json else []
-    balances = json.loads(balances_json) if balances_json else {}
+    addresses_raw = await redis_get('watcher:addresses')
+    if isinstance(addresses_raw, list):
+        addresses = addresses_raw
+    elif isinstance(addresses_raw, str):
+        try:
+            parsed = json.loads(addresses_raw)
+            addresses = parsed if isinstance(parsed, list) else []
+        except Exception:
+            addresses = []
+    else:
+        addresses = []
+
+    balances_raw = await redis_get('watcher:balances')
+    if isinstance(balances_raw, dict):
+        balances = balances_raw
+    elif isinstance(balances_raw, str):
+        try:
+            parsed = json.loads(balances_raw)
+            balances = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            balances = {}
+    else:
+        balances = {}
     month = await redis_get('watcher:month') or '2026-05'
 
     dropout_addr_raw = await redis_get(f'dropout_addresses:{month}')
@@ -512,12 +531,16 @@ async def main():
         print(f'[시작] 탈락 주소 샘플: {sample}{"..." if len(dropout_set) > 3 else ""}')
 
     # 시작 시 일관성 체크: 탈락 주소가 잔액에 남아있으면 제거
-    overlap = [a for a in dropout_set if a in balances]
-    if overlap:
-        for a in overlap:
-            balances.pop(a)
-        print(f'[시작] 잔액 목록에서 탈락 주소 {len(overlap)}개 제거 (재시작 일관성 보정)')
-        await redis_set('watcher:balances', json.dumps(balances))
+    if isinstance(balances, dict):
+        overlap = [a for a in dropout_set if a in balances]
+        if overlap:
+            for a in overlap:
+                balances.pop(a, None)
+            print(f'[시작] 잔액 목록에서 탈락 주소 {len(overlap)}개 제거 (재시작 일관성 보정)')
+            await redis_set('watcher:balances', json.dumps(balances))
+    else:
+        print(f'[경고] balances 타입 오류: {type(balances)} — 일관성 체크 스킵')
+        balances = {}
 
     # 공유 state
     state = {
