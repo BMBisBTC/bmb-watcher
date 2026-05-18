@@ -529,17 +529,27 @@ async def main():
         sample = sorted(dropout_set)[:3]
         print(f'[시작] 탈락 주소 샘플: {sample}{"..." if len(dropout_set) > 3 else ""}')
 
-    # 시작 시 일관성 체크: 탈락 주소가 잔액에 남아있으면 제거
-    if isinstance(balances, dict):
-        overlap = [a for a in dropout_set if a in balances]
-        if overlap:
-            for a in overlap:
-                balances.pop(a, None)
-            print(f'[시작] 잔액 목록에서 탈락 주소 {len(overlap)}개 제거 (재시작 일관성 보정)')
-            await redis_set('watcher:balances', balances)
-    else:
-        print(f'[경고] balances 타입 오류: {type(balances)} — 일관성 체크 스킵')
-        balances = {}
+    # 시작 시 일관성 체크: 탈락 주소를 addresses / balances 에서 모두 제거
+    if dropout_set:
+        # addresses에서 제거 (subscribe 대상에서 제외)
+        before_addr = len(addresses)
+        addresses = [a for a in addresses if a not in dropout_set]
+        removed_addr = before_addr - len(addresses)
+        if removed_addr:
+            print(f'[시작] addresses에서 탈락 주소 {removed_addr}개 제거 → {len(addresses)}개')
+            await redis_set('watcher:addresses', addresses)
+
+        # balances에서 제거
+        if isinstance(balances, dict):
+            overlap = [a for a in dropout_set if a in balances]
+            if overlap:
+                for a in overlap:
+                    balances.pop(a, None)
+                print(f'[시작] balances에서 탈락 주소 {len(overlap)}개 제거')
+                await redis_set('watcher:balances', balances)
+        else:
+            print(f'[경고] balances 타입 오류: {type(balances)} — 일관성 체크 스킵')
+            balances = {}
 
     # 공유 state
     state = {
