@@ -21,6 +21,40 @@ MIN_PAYOUT_COUNT = 100  # 이자 지급 TX 판정 최소 수령자 수
 KST = timezone(timedelta(hours=9))
 
 
+def parse_list(raw):
+    """Upstash REST API 반환값을 list로 파싱 (이중 인코딩 대응)"""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            if isinstance(v, list):
+                return v
+            if isinstance(v, str):
+                v2 = json.loads(v)
+                return v2 if isinstance(v2, list) else []
+        except Exception:
+            pass
+    return []
+
+
+def parse_dict(raw):
+    """Upstash REST API 반환값을 dict로 파싱 (이중 인코딩 대응)"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            if isinstance(v, dict):
+                return v
+            if isinstance(v, str):
+                v2 = json.loads(v)
+                return v2 if isinstance(v2, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
 def address_to_scripthash(address: str) -> str:
     decoded = base58.b58decode_check(address)
     pubkey_hash = decoded[1:]
@@ -137,15 +171,7 @@ async def handle_payout_event(txids: list, state: dict):
 
     # hd:months 업데이트
     months_raw = await redis_get('hd:months')
-    if isinstance(months_raw, list):
-        months = months_raw
-    elif isinstance(months_raw, str):
-        try:
-            months = json.loads(months_raw)
-        except Exception:
-            months = []
-    else:
-        months = []
+    months = parse_list(months_raw)
     new_month_entry = {
         'month': month_key,
         'count': count,
@@ -170,7 +196,7 @@ async def handle_payout_event(txids: list, state: dict):
     # 새 월로 전환
     new_month = next_month(current_month)
     await redis_set('watcher:month', new_month)
-    await redis_set('watcher:addresses', json.dumps(recipient_list))
+    await redis_set('watcher:addresses', recipient_list)
     await redis_set('dropout:' + new_month, '0')
     await redis_set('dropout_addresses:' + new_month, [])
     print(f'[이자지급] 감시 월 전환: {current_month} → {new_month}')
@@ -201,7 +227,7 @@ async def handle_payout_event(txids: list, state: dict):
                     pass
             await asyncio.sleep(0.3)
 
-    await redis_set('watcher:balances', json.dumps(new_balances))
+    await redis_set('watcher:balances', new_balances)
     print(f'[스냅샷] {len(new_balances)}개 저장 완료')
 
     # state 업데이트
@@ -330,15 +356,7 @@ class Connection:
                 # 최종 안전장치: Redis에서 한 번 더 중복 확인
                 addr_key = dropout_key.replace('dropout:', 'dropout_addresses:')
                 redis_raw = await redis_get(addr_key)
-                if isinstance(redis_raw, list):
-                    redis_dropout_check = set(redis_raw)
-                elif isinstance(redis_raw, str):
-                    try:
-                        redis_dropout_check = set(json.loads(redis_raw))
-                    except Exception:
-                        redis_dropout_check = set()
-                else:
-                    redis_dropout_check = set()
+                redis_dropout_check = set(parse_list(redis_raw))
 
                 if address in redis_dropout_check:
                     print(f'[탈락] {address} 이미 Redis에 기록됨, 중복 스킵')
@@ -347,7 +365,7 @@ class Connection:
                 # Redis 업데이트: 카운트 증가, 주소 목록, 잔액
                 await redis_incr(dropout_key)
                 await redis_set(addr_key, sorted(list(self.state['dropout_set'])))
-                await redis_set('watcher:balances', json.dumps(balances))
+                await redis_set('watcher:balances', balances)
                 print(f'[탈락] {address} 처리 완료, 이후 무시 (누적 {len(self.state["dropout_set"])}명)')
             else:
                 balances[address] = confirmed
@@ -486,41 +504,22 @@ class PayoutWatcher:
 
 async def main():
     addresses_raw = await redis_get('watcher:addresses')
-    if isinstance(addresses_raw, list):
-        addresses = addresses_raw
-    elif isinstance(addresses_raw, str):
-        try:
-            parsed = json.loads(addresses_raw)
-            addresses = parsed if isinstance(parsed, list) else []
-        except Exception:
-            addresses = []
-    else:
-        addresses = []
+    addresses = parse_list(addresses_raw)
 
     balances_raw = await redis_get('watcher:balances')
-    if isinstance(balances_raw, dict):
-        balances = balances_raw
-    elif isinstance(balances_raw, str):
-        try:
-            parsed = json.loads(balances_raw)
-            balances = parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            balances = {}
-    else:
-        balances = {}
+    balances = parse_dict(balances_raw)
+
+    # 이중 인코딩된 채로 저장돼 있었으면 올바른 형식으로 재저장
+    if balances and isinstance(balances_raw, str):
+        print('[시작] watcher:balances 재저장 (이중 인코딩 보정)')
+        await redis_set('watcher:balances', balances)
+    if addresses and isinstance(addresses_raw, str):
+        print('[시작] watcher:addresses 재저장 (이중 인코딩 보정)')
+        await redis_set('watcher:addresses', addresses)
     month = await redis_get('watcher:month') or '2026-05'
 
     dropout_addr_raw = await redis_get(f'dropout_addresses:{month}')
-    if isinstance(dropout_addr_raw, list):
-        dropout_addresses_list = dropout_addr_raw
-    elif isinstance(dropout_addr_raw, str):
-        try:
-            dropout_addresses_list = json.loads(dropout_addr_raw)
-        except Exception:
-            dropout_addresses_list = []
-    else:
-        dropout_addresses_list = []
-    dropout_set = set(dropout_addresses_list)
+    dropout_set = set(parse_list(dropout_addr_raw))
 
     print(f'주소 {len(addresses)}개 로드 완료')
     print(f'감시 월: {month}')
@@ -537,7 +536,7 @@ async def main():
             for a in overlap:
                 balances.pop(a, None)
             print(f'[시작] 잔액 목록에서 탈락 주소 {len(overlap)}개 제거 (재시작 일관성 보정)')
-            await redis_set('watcher:balances', json.dumps(balances))
+            await redis_set('watcher:balances', balances)
     else:
         print(f'[경고] balances 타입 오류: {type(balances)} — 일관성 체크 스킵')
         balances = {}
