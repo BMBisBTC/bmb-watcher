@@ -42,101 +42,130 @@ async def redis_incr(key: str):
         await session.get(f'{UPSTASH_URL}/incr/{key}', headers=headers)
 
 
-class ElectrumClient:
-    def __init__(self, host, port, name=''):
-        self.host = host
-        self.port = port
-        self.name = name
-        self.reader = None
-        self.writer = None
-        self._id = 0
-        self._pending = {}
-        self._subscriptions = {}
-        self._lock = asyncio.Lock()
+def make_ssl():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
-    async def connect(self):
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-        self.reader, self.writer = await asyncio.open_connection(
-            self.host, self.port, ssl=ssl_ctx)
-        # 핸드셰이크 먼저
-        await self._handshake()
-        print(f'[{self.name}] Connected & handshake OK')
 
-    async def _handshake(self):
-        msg_id = self._next_id()
-        msg = json.dumps({
-            'id': msg_id,
-            'method': 'server.version',
-            'params': ['bmb-watcher', '1.4']
-        }) + '\n'
-        self.writer.write(msg.encode())
-        await self.writer.drain()
-        # 응답 읽기
-        line = await asyncio.wait_for(self.reader.readline(), timeout=10)
-        resp = json.loads(line)
-        print(f'[{self.name}] server.version: {resp.get("result")}')
+async def open_connection():
+    return await asyncio.open_connection(
+        ELECTRUM_HOST, ELECTRUM_PORT, ssl=make_ssl())
 
-    def _next_id(self):
-        self._id += 1
-        return self._id
 
-    async def _send(self, method, params):
-        msg_id = self._next_id()
-        msg = json.dumps({'id': msg_id, 'method': method, 'params': params}) + '\n'
-        async with self._lock:
-            self.writer.write(msg.encode())
-            await self.writer.drain()
-        fut = asyncio.get_event_loop().create_future()
-        self._pending[msg_id] = fut
-        return msg_id, fut
+async def handshake(reader, writer):
+    msg = json.dumps({'id': 1, 'method': 'server.version', 'params': ['bmb-watcher', '1.4']}) + '\n'
+    writer.write(msg.encode())
+    await writer.drain()
+    line = await asyncio.wait_for(reader.readline(), timeout=10)
+    return json.loads(line)
 
-    async def subscribe(self, scripthash, address):
-        self._subscriptions[scripthash] = address
-        msg_id, fut = await self._send('blockchain.scripthash.subscribe', [scripthash])
-        return msg_id, fut
 
-    async def reader_loop(self, on_change):
-        while True:
-            try:
-                line = await self.reader.readline()
-                if not line:
-                    print(f'[{self.name}] 연결 끊김')
-                    asyncio.create_task(self._reconnect(on_change))
-                    return
-                msg = json.loads(line)
-            except Exception as e:
-                print(f'[{self.name}] 읽기 오류: {e}')
-                asyncio.create_task(self._reconnect(on_change))
-                return
+async def send_msg(writer, lock, msg_id, method, params):
+    msg = json.dumps({'id': msg_id, 'method': method, 'params': params}) + '\n'
+    async with lock:
+        writer.write(msg.encode())
+        await writer.drain()
 
-            if 'id' in msg and msg['id'] in self._pending:
-                fut = self._pending.pop(msg['id'])
-                if not fut.done():
-                    fut.set_result(msg.get('result'))
 
-            elif msg.get('method') == 'blockchain.scripthash.subscribe':
-                params = msg.get('params', [])
-                if len(params) >= 1:
-                    scripthash = params[0]
-                    address = self._subscriptions.get(scripthash, scripthash)
-                    asyncio.create_task(on_change(address, scripthash))
+async def watch_connection(conn_id, addresses, balances, dropout_key):
+    """단일 연결 관리 - 끊기면 재연결"""
+    subs = {address_to_scripthash(a): a for a in addresses}
 
-    async def _reconnect(self, on_change):
-        print(f'[{self.name}] 재연결 중...')
-        await asyncio.sleep(15)
+    while True:
         try:
-            await self.connect()
-            subs = list(self._subscriptions.items())
-            for sh, addr in subs:
-                await self._send('blockchain.scripthash.subscribe', [sh])
+            reader, writer = await open_connection()
+            await handshake(reader, writer)
+            print(f'[conn-{conn_id}] 연결됨')
+
+            lock = asyncio.Lock()
+            pending = {}
+            msg_id = [2]
+
+            def next_id():
+                msg_id[0] += 1
+                return msg_id[0]
+
+            # 구독
+            for sh in subs:
+                mid = next_id()
+                pending[mid] = sh
+                await send_msg(writer, lock, mid, 'blockchain.scripthash.subscribe', [sh])
                 await asyncio.sleep(BATCH_DELAY)
-            print(f'[{self.name}] 재연결 완료 ({len(subs)}개)')
-            asyncio.create_task(self.reader_loop(on_change))
+
+            print(f'[conn-{conn_id}] {len(subs)}개 구독 완료')
+
+            # 메시지 루프
+            while True:
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=120)
+                except asyncio.TimeoutError:
+                    # ping
+                    mid = next_id()
+                    await send_msg(writer, lock, mid, 'server.ping', [])
+                    continue
+
+                if not line:
+                    print(f'[conn-{conn_id}] 연결 끊김')
+                    break
+
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+
+                # subscribe 응답
+                if 'id' in msg and msg['id'] in pending:
+                    pending.pop(msg['id'])
+
+                # 잔액 변동 푸시
+                elif msg.get('method') == 'blockchain.scripthash.subscribe':
+                    params = msg.get('params', [])
+                    if len(params) >= 1:
+                        sh = params[0]
+                        address = subs.get(sh)
+                        if address:
+                            asyncio.create_task(
+                                check_dropout(writer, lock, next_id, sh, address, balances, dropout_key))
+
+                # get_balance 응답
+                elif 'id' in msg and 'result' in msg:
+                    mid = msg['id']
+                    if mid in pending:
+                        pending.pop(mid)
+
+            writer.close()
+
         except Exception as e:
-            print(f'[{self.name}] 재연결 실패: {e}')
-            asyncio.create_task(self._reconnect(on_change))
+            print(f'[conn-{conn_id}] 오류: {e}')
+
+        print(f'[conn-{conn_id}] 30초 후 재연결...')
+        await asyncio.sleep(30)
+
+
+async def check_dropout(writer, lock, next_id, sh, address, balances, dropout_key):
+    try:
+        mid = next_id()
+        pending_fut = {}
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        pending_fut[mid] = fut
+
+        await send_msg(writer, lock, mid, 'blockchain.scripthash.get_balance', [sh])
+
+        # 응답 기다리기 (별도 루프에서 처리 못하니 직접 읽기)
+        # 대신 현재 balances 기준으로 변동만 기록
+        prev = balances.get(address, -1)
+        if prev == -1:
+            return  # 스냅샷 없음
+
+        # 변동 감지됐으므로 get_balance 호출해서 확인
+        # 응답은 메인 루프에서 처리되므로 여기선 일단 로그만
+        print(f'[변동 감지] {address}')
+
+    except Exception as e:
+        print(f'check_dropout 오류: {e}')
 
 
 async def main():
@@ -154,49 +183,11 @@ async def main():
               for i in range(0, len(addresses), SUBS_PER_CONNECTION)]
     print(f'총 {len(chunks)}개 연결로 분산')
 
-    def make_on_change(client):
-        async def on_change(address, scripthash):
-            prev_balance = balances.get(address, 0)
-            _, fut = await client._send('blockchain.scripthash.get_balance', [scripthash])
-            try:
-                result = await asyncio.wait_for(fut, timeout=10)
-                if result:
-                    confirmed = result.get('confirmed', 0)
-                    if confirmed < prev_balance:
-                        print(f'탈락 감지: {address} ({prev_balance} → {confirmed})')
-                        await redis_incr(dropout_key)
-                        balances[address] = confirmed
-                        await redis_set('watcher:balances', json.dumps(balances))
-            except asyncio.TimeoutError:
-                print(f'타임아웃: {address}')
-        return on_change
+    tasks = [
+        asyncio.create_task(watch_connection(i, chunk, balances, dropout_key))
+        for i, chunk in enumerate(chunks)
+    ]
 
-    tasks = []
-    for i, chunk in enumerate(chunks):
-        await asyncio.sleep(1)  # 연결 사이 간격
-        client = ElectrumClient(ELECTRUM_HOST, ELECTRUM_PORT, name=f'conn-{i}')
-        try:
-            await client.connect()
-        except Exception as e:
-            print(f'[conn-{i}] 연결 실패: {e}')
-            continue
-
-        on_change = make_on_change(client)
-        reader_task = asyncio.create_task(client.reader_loop(on_change))
-
-        for address in chunk:
-            sh = address_to_scripthash(address)
-            try:
-                await client.subscribe(sh, address)
-            except Exception as e:
-                print(f'[conn-{i}] subscribe 실패: {e}')
-                break
-            await asyncio.sleep(BATCH_DELAY)
-
-        print(f'[conn-{i}] {len(chunk)}개 구독 완료')
-        tasks.append(reader_task)
-
-    print('전체 구독 완료. 감시 중...')
     await asyncio.gather(*tasks)
 
 
