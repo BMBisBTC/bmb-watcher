@@ -201,6 +201,7 @@ async def handle_payout_event(txids: list, state: dict):
     state['addresses'] = recipient_list
     state['balances'] = new_balances
     state['dropout_key'] = f'dropout:{new_month}'
+    state['dropout_set'] = set()  # 새 달 시작 - 탈락 없음
     print(f'[완료] 자동 전환 완료! 이제 {new_month} 감시 시작')
 
 
@@ -292,6 +293,10 @@ class Connection:
 
     async def handle_change(self, sh, address):
         try:
+            # 이미 탈락한 지갑은 완전히 무시 (Redis 조회 없이 메모리로만 체크)
+            if address in self.state['dropout_set']:
+                return
+
             balances = self.state['balances']
             dropout_key = self.state['dropout_key']
             prev = balances.get(address, -1)
@@ -305,23 +310,18 @@ class Connection:
 
             confirmed = result.get('confirmed', 0)
             if confirmed < prev:
-                print(f'[탈락감지] {address} ({prev} → {confirmed})')
+                print(f'[탈락] {address} ({prev} → {confirmed})')
 
-                # 이미 탈락 목록에 있는지 확인 (중복 카운트 방지)
+                # 메모리 처리: dropout_set 추가 + balances에서 제거 (이후 완전 무시)
+                self.state['dropout_set'].add(address)
+                balances.pop(address, None)
+
+                # Redis 업데이트: 카운트 증가, 주소 목록, 잔액
+                await redis_incr(dropout_key)
                 addr_key = dropout_key.replace('dropout:', 'dropout_addresses:')
-                existing_raw = await redis_get(addr_key)
-                existing = json.loads(existing_raw) if existing_raw else []
-
-                if address not in existing:
-                    await redis_incr(dropout_key)
-                    existing.append(address)
-                    await redis_set(addr_key, existing)
-                    print(f'[탈락] {address} 탈락 확정 (누적 {len(existing)}명)')
-                else:
-                    print(f'[탈락-중복] {address} 이미 탈락 목록에 있음, 카운트 유지')
-
-                balances[address] = confirmed
+                await redis_set(addr_key, sorted(list(self.state['dropout_set'])))
                 await redis_set('watcher:balances', json.dumps(balances))
+                print(f'[탈락] {address} 처리 완료, 이후 무시 (누적 {len(self.state["dropout_set"])}명)')
             else:
                 balances[address] = confirmed
 
@@ -464,9 +464,14 @@ async def main():
     balances = json.loads(balances_json) if balances_json else {}
     month = await redis_get('watcher:month') or '2026-05'
 
+    dropout_addr_raw = await redis_get(f'dropout_addresses:{month}')
+    dropout_addresses_list = json.loads(dropout_addr_raw) if dropout_addr_raw else []
+    dropout_set = set(dropout_addresses_list)
+
     print(f'주소 {len(addresses)}개 로드 완료')
     print(f'감시 월: {month}')
     print(f'잔액 스냅샷: {len(balances)}개')
+    print(f'탈락 주소 {len(dropout_set)}개 로드 완료 (감시 제외)')
 
     # 공유 state
     state = {
@@ -474,6 +479,7 @@ async def main():
         'addresses': addresses,
         'balances': balances,
         'dropout_key': f'dropout:{month}',
+        'dropout_set': dropout_set,
     }
 
     chunks = [addresses[i:i+SUBS_PER_CONNECTION]
