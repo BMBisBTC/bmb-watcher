@@ -305,8 +305,21 @@ class Connection:
 
             confirmed = result.get('confirmed', 0)
             if confirmed < prev:
-                print(f'[탈락] {address} ({prev} → {confirmed})')
-                await redis_incr(dropout_key)
+                print(f'[탈락감지] {address} ({prev} → {confirmed})')
+
+                # 이미 탈락 목록에 있는지 확인 (중복 카운트 방지)
+                addr_key = dropout_key.replace('dropout:', 'dropout_addresses:')
+                existing_raw = await redis_get(addr_key)
+                existing = json.loads(existing_raw) if existing_raw else []
+
+                if address not in existing:
+                    await redis_incr(dropout_key)
+                    existing.append(address)
+                    await redis_set(addr_key, existing)
+                    print(f'[탈락] {address} 탈락 확정 (누적 {len(existing)}명)')
+                else:
+                    print(f'[탈락-중복] {address} 이미 탈락 목록에 있음, 카운트 유지')
+
                 balances[address] = confirmed
                 await redis_set('watcher:balances', json.dumps(balances))
             else:
