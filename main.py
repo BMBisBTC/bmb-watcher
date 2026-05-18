@@ -20,6 +20,8 @@ INTEREST_TOLERANCE = 100  # satoshi 오차 허용
 MIN_PAYOUT_COUNT = 100  # 이자 지급 TX 판정 최소 수령자 수
 KST = timezone(timedelta(hours=9))
 
+VERCEL_PUSH_URL = 'https://bmb-monitor.vercel.app/api/push/send'
+
 
 def parse_list(raw):
     """Upstash REST API 반환값을 list로 파싱 (이중 인코딩 대응)"""
@@ -53,6 +55,18 @@ def parse_dict(raw):
         except Exception:
             pass
     return {}
+
+
+def extract_address_set(raw):
+    """dropout_addresses 원시 값에서 주소 문자열 집합 추출 (string/dict 혼용 대응)"""
+    lst = parse_list(raw)
+    result = set()
+    for item in lst:
+        if isinstance(item, str):
+            result.add(item)
+        elif isinstance(item, dict) and 'address' in item:
+            result.add(item['address'])
+    return result
 
 
 def address_to_scripthash(address: str) -> str:
@@ -118,6 +132,27 @@ def next_month(month_key: str) -> str:
     if month == 12:
         return f'{year + 1}-01'
     return f'{year}-{str(month + 1).zfill(2)}'
+
+
+async def send_push_notification(address: str, month: str, dropout_count: int):
+    """Vercel 푸시 알림 API 호출 + 중복 방지용 push_notified 업데이트"""
+    try:
+        payload = {'type': 'hd', 'address': address}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                VERCEL_PUSH_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                print(f'[푸시] 알림 전송 완료 (status={resp.status})')
+
+        # cron의 checkHdDropout에서 중복 발송 방지
+        notified_raw = await redis_get('hd:push_notified')
+        notified = parse_dict(notified_raw)
+        notified[month] = dropout_count
+        await redis_set('hd:push_notified', notified)
+    except Exception as e:
+        print(f'[푸시] 알림 전송 실패: {e}')
 
 
 async def analyze_payout_tx(txid: str):
@@ -190,7 +225,14 @@ async def handle_payout_event(txids: list, state: dict):
     dropout_addresses = sorted(list(prev_set - new_set))
     dropout_count = len(dropout_addresses)
     await redis_set(f'dropout:{current_month}', str(dropout_count))
-    await redis_set(f'dropout_addresses:{current_month}', dropout_addresses)
+
+    # 탈락 주소를 구조화된 형태로 저장 (payout_time 기준, txid 없음)
+    payout_unix = int(payout_time) if payout_time else int(datetime.now(KST).timestamp())
+    dropout_entries = [
+        {"address": addr, "time": payout_unix, "txid": ""}
+        for addr in dropout_addresses
+    ]
+    await redis_set(f'dropout_addresses:{current_month}', dropout_entries)
     print(f'[이자지급] {current_month} 탈락 확정: {dropout_count}명')
 
     # 새 월로 전환
@@ -356,17 +398,38 @@ class Connection:
                 # 최종 안전장치: Redis에서 한 번 더 중복 확인
                 addr_key = dropout_key.replace('dropout:', 'dropout_addresses:')
                 redis_raw = await redis_get(addr_key)
-                redis_dropout_check = set(parse_list(redis_raw))
+                existing_list = parse_list(redis_raw)
+                existing_addresses = extract_address_set(redis_raw)
 
-                if address in redis_dropout_check:
+                if address in existing_addresses:
                     print(f'[탈락] {address} 이미 Redis에 기록됨, 중복 스킵')
                     return
 
-                # Redis 업데이트: 카운트 증가, 주소 목록, 잔액
-                await redis_incr(dropout_key)
-                await redis_set(addr_key, sorted(list(self.state['dropout_set'])))
+                # Electrum history에서 최신 txid 조회
+                latest_txid = ''
+                try:
+                    fut_hist = await self.send('blockchain.scripthash.get_history', [sh])
+                    history = await asyncio.wait_for(fut_hist, timeout=10)
+                    if history:
+                        latest_txid = history[-1]['tx_hash']
+                except Exception:
+                    pass
+
+                kst_time = int(datetime.now(KST).timestamp())
+                new_entry = {"address": address, "time": kst_time, "txid": latest_txid}
+                existing_list.append(new_entry)
+
+                # Redis 업데이트: 카운트 증가, 구조화된 주소 목록, 잔액
+                new_count = await redis_incr(dropout_key)
+                await redis_set(addr_key, existing_list)
                 await redis_set('watcher:balances', balances)
                 print(f'[탈락] {address} 처리 완료, 이후 무시 (누적 {len(self.state["dropout_set"])}명)')
+
+                # 푸시 알림 발송 (비동기, 실패해도 무관)
+                month = self.state['month']
+                asyncio.create_task(
+                    send_push_notification(address, month, new_count or len(self.state['dropout_set']))
+                )
             else:
                 balances[address] = confirmed
 
@@ -487,7 +550,7 @@ class PayoutWatcher:
             print(f'[PayoutWatcher] 새 TX {len(new_txids)}개 감지')
 
             await asyncio.sleep(60)  # 이자 지급이 여러 TX로 나뉘므로 추가 대기
-            
+
             # 다시 최신 TX 목록 가져오기
             fut2 = await self.send('blockchain.scripthash.get_history', [self.payout_sh])
             history2 = await asyncio.wait_for(fut2, timeout=30)
@@ -519,7 +582,8 @@ async def main():
     month = await redis_get('watcher:month') or '2026-05'
 
     dropout_addr_raw = await redis_get(f'dropout_addresses:{month}')
-    dropout_set = set(parse_list(dropout_addr_raw))
+    # string/dict 혼용 대응
+    dropout_set = extract_address_set(dropout_addr_raw)
 
     print(f'주소 {len(addresses)}개 로드 완료')
     print(f'감시 월: {month}')
