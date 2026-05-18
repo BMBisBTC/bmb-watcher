@@ -136,8 +136,16 @@ async def handle_payout_event(txids: list, state: dict):
     month_key = f'{kst_time.year}-{str(kst_time.month).zfill(2)}'
 
     # hd:months 업데이트
-    months_json = await redis_get('hd:months')
-    months = json.loads(months_json) if months_json else []
+    months_raw = await redis_get('hd:months')
+    if isinstance(months_raw, list):
+        months = months_raw
+    elif isinstance(months_raw, str):
+        try:
+            months = json.loads(months_raw)
+        except Exception:
+            months = []
+    else:
+        months = []
     new_month_entry = {
         'month': month_key,
         'count': count,
@@ -301,6 +309,9 @@ class Connection:
             dropout_key = self.state['dropout_key']
             prev = balances.get(address, -1)
             if prev == -1:
+                # 잔액 스냅샷에 없음 → 이미 탈락 처리됐거나 미추적. dropout_set에 추가해 이후 무시
+                if address not in self.state['dropout_set']:
+                    self.state['dropout_set'].add(address)
                 return
 
             fut = await self.send('blockchain.scripthash.get_balance', [sh])
@@ -316,9 +327,25 @@ class Connection:
                 self.state['dropout_set'].add(address)
                 balances.pop(address, None)
 
+                # 최종 안전장치: Redis에서 한 번 더 중복 확인
+                addr_key = dropout_key.replace('dropout:', 'dropout_addresses:')
+                redis_raw = await redis_get(addr_key)
+                if isinstance(redis_raw, list):
+                    redis_dropout_check = set(redis_raw)
+                elif isinstance(redis_raw, str):
+                    try:
+                        redis_dropout_check = set(json.loads(redis_raw))
+                    except Exception:
+                        redis_dropout_check = set()
+                else:
+                    redis_dropout_check = set()
+
+                if address in redis_dropout_check:
+                    print(f'[탈락] {address} 이미 Redis에 기록됨, 중복 스킵')
+                    return
+
                 # Redis 업데이트: 카운트 증가, 주소 목록, 잔액
                 await redis_incr(dropout_key)
-                addr_key = dropout_key.replace('dropout:', 'dropout_addresses:')
                 await redis_set(addr_key, sorted(list(self.state['dropout_set'])))
                 await redis_set('watcher:balances', json.dumps(balances))
                 print(f'[탈락] {address} 처리 완료, 이후 무시 (누적 {len(self.state["dropout_set"])}명)')
@@ -465,13 +492,32 @@ async def main():
     month = await redis_get('watcher:month') or '2026-05'
 
     dropout_addr_raw = await redis_get(f'dropout_addresses:{month}')
-    dropout_addresses_list = json.loads(dropout_addr_raw) if dropout_addr_raw else []
+    if isinstance(dropout_addr_raw, list):
+        dropout_addresses_list = dropout_addr_raw
+    elif isinstance(dropout_addr_raw, str):
+        try:
+            dropout_addresses_list = json.loads(dropout_addr_raw)
+        except Exception:
+            dropout_addresses_list = []
+    else:
+        dropout_addresses_list = []
     dropout_set = set(dropout_addresses_list)
 
     print(f'주소 {len(addresses)}개 로드 완료')
     print(f'감시 월: {month}')
     print(f'잔액 스냅샷: {len(balances)}개')
-    print(f'탈락 주소 {len(dropout_set)}개 로드 완료 (감시 제외)')
+    print(f'탈락 주소 {len(dropout_set)}개 로드 완료 (Redis dropout_addresses:{month})')
+    if dropout_set:
+        sample = sorted(dropout_set)[:3]
+        print(f'[시작] 탈락 주소 샘플: {sample}{"..." if len(dropout_set) > 3 else ""}')
+
+    # 시작 시 일관성 체크: 탈락 주소가 잔액에 남아있으면 제거
+    overlap = [a for a in dropout_set if a in balances]
+    if overlap:
+        for a in overlap:
+            balances.pop(a)
+        print(f'[시작] 잔액 목록에서 탈락 주소 {len(overlap)}개 제거 (재시작 일관성 보정)')
+        await redis_set('watcher:balances', json.dumps(balances))
 
     # 공유 state
     state = {
